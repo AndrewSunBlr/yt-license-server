@@ -39,23 +39,46 @@ except ImportError:
 # Генерация ключей при первом запуске
 SERVER_PRIVATE_KEY_HEX = os.environ.get("SERVER_PRIVATE_KEY", "")
 SERVER_PUBLIC_KEY_HEX = ""
+APP_SHARED_SECRET = os.environ.get("APP_SHARED_SECRET", "")
 
-# Если нет приватного ключа в окружении — генерируем новый
-if not SERVER_PRIVATE_KEY_HEX and HAS_CRYPTO:
+# Загрузка или генерация ключей
+if SERVER_PRIVATE_KEY_HEX and HAS_CRYPTO:
+    try:
+        private_key = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(SERVER_PRIVATE_KEY_HEX))
+        SERVER_PUBLIC_KEY_HEX = private_key.public_key().public_bytes_raw().hex()
+        print(f"[✓] Public key loaded from SERVER_PRIVATE_KEY")
+        print(f"[✓] Public key: {SERVER_PUBLIC_KEY_HEX[:32]}...")
+    except Exception as e:
+        print(f"[!] Error loading private key: {e}")
+        # Генерируем новый если ключ битый
+        private_key = Ed25519PrivateKey.generate()
+        SERVER_PRIVATE_KEY_HEX = private_key.private_bytes_raw().hex()
+        SERVER_PUBLIC_KEY_HEX = private_key.public_key().public_bytes_raw().hex()
+        print(f"[!] Generated new key pair (old SERVER_PRIVATE_KEY was invalid)")
+        print(f"[!] SAVE THIS PRIVATE KEY in Render Environment Variables:")
+        print(f"SERVER_PRIVATE_KEY={SERVER_PRIVATE_KEY_HEX}")
+elif not SERVER_PRIVATE_KEY_HEX and HAS_CRYPTO:
     private_key = Ed25519PrivateKey.generate()
     SERVER_PRIVATE_KEY_HEX = private_key.private_bytes_raw().hex()
     SERVER_PUBLIC_KEY_HEX = private_key.public_key().public_bytes_raw().hex()
-    print(f"[!] Generated new key pair!")
-    print(f"[!] PUBLIC KEY (copy to client security.py):")
-    print(f"SERVER_PUBKEY_HEX = \"{SERVER_PUBLIC_KEY_HEX}\"")
-    print(f"[!] APP_SHARED_SECRET: use any 64 hex chars")
+    print(f"[!] Generated new key pair (no SERVER_PRIVATE_KEY found)")
+    print(f"[!] SAVE THIS PRIVATE KEY in Render Environment Variables:")
+    print(f"SERVER_PRIVATE_KEY={SERVER_PRIVATE_KEY_HEX}")
+else:
+    print(f"[!] No cryptography available - running in DEV mode")
+    SERVER_PUBLIC_KEY_HEX = "dev_mode_no_crypto"
 
-APP_SHARED_SECRET = os.environ.get("APP_SHARED_SECRET", "")
 if not APP_SHARED_SECRET:
     APP_SHARED_SECRET = secrets.token_hex(32)
     print(f"[!] APP_SHARED_SECRET = \"{APP_SHARED_SECRET}\"")
+    print(f"[!] SAVE THIS SHARED SECRET in Render Environment Variables:")
+    print(f"APP_SHARED_SECRET={APP_SHARED_SECRET}")
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://localhost/yt_licenses")
+
+print(f"[✓] Cryptography available: {HAS_CRYPTO}")
+print(f"[✓] Public key available: {bool(SERVER_PUBLIC_KEY_HEX)}")
+print(f"[✓] Shared secret available: {bool(APP_SHARED_SECRET)}")
 
 # ─── Database ─────────────────────────────────────────────────────────────────
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
@@ -201,11 +224,14 @@ def verify_signature(payload: dict, sig: str) -> bool:
 def sign_response(data: dict, ts: int) -> dict:
     """Подпись ответа Ed25519"""
     response = {"data": data, "ts": ts}
-    if HAS_CRYPTO and SERVER_PRIVATE_KEY_HEX:
-        private_key = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(SERVER_PRIVATE_KEY_HEX))
-        msg = json.dumps({"data": data, "ts": ts}, sort_keys=True, separators=(',', ':')).encode('utf-8')
-        sig = private_key.sign(msg).hex()
-        response["sig_ed25519"] = sig
+    if HAS_CRYPTO and SERVER_PRIVATE_KEY_HEX and SERVER_PUBLIC_KEY_HEX != "dev_mode_no_crypto":
+        try:
+            private_key = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(SERVER_PRIVATE_KEY_HEX))
+            msg = json.dumps({"data": data, "ts": ts}, sort_keys=True, separators=(',', ':')).encode('utf-8')
+            sig = private_key.sign(msg).hex()
+            response["sig_ed25519"] = sig
+        except Exception as e:
+            print(f"[!] Sign error: {e}")
     return response
 
 
@@ -264,8 +290,10 @@ def check_credits(license_key: str, required: int) -> tuple[bool, int, str]:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("🚀 License Server starting...")
-    print(f"📊 Database: {DATABASE_URL}")
+    print(f"📊 Database: {DATABASE_URL[:50]}...")
     print(f"🔑 Public key available: {bool(SERVER_PUBLIC_KEY_HEX)}")
+    if SERVER_PUBLIC_KEY_HEX and SERVER_PUBLIC_KEY_HEX != "dev_mode_no_crypto":
+        print(f"🔑 Public key: {SERVER_PUBLIC_KEY_HEX[:32]}...")
     yield
     print("👋 Shutting down...")
 
@@ -290,7 +318,7 @@ async def health():
 
 @app.get("/pubkey")
 async def pubkey():
-    return {"public_key": SERVER_PUBLIC_KEY_HEX or "not_available"}
+    return {"public_key": SERVER_PUBLIC_KEY_HEX if SERVER_PUBLIC_KEY_HEX else "not_available"}
 
 
 # ─── License endpoints ───────────────────────────────────────────────────────
