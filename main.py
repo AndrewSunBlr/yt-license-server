@@ -2,8 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 YouTube Localizer License Server v3.0
-- Исправлен webhook: сохраняет ключ от Lemon Squeezy
-- Подробное логирование для отладки
+- Получение лицензионного ключа через API Lemon Squeezy
 """
 
 import os
@@ -12,6 +11,7 @@ import time
 import hmac
 import hashlib
 import secrets
+import requests
 from datetime import datetime, timedelta
 from typing import Optional
 from contextlib import asynccontextmanager
@@ -38,6 +38,8 @@ SERVER_PRIVATE_KEY_HEX = os.environ.get("SERVER_PRIVATE_KEY", "")
 APP_SHARED_SECRET = os.environ.get("APP_SHARED_SECRET", "")
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://localhost/yt_licenses")
 LEMON_WEBHOOK_SECRET = os.environ.get("LEMON_WEBHOOK_SECRET", "")
+LEMON_API_KEY = os.environ.get("LEMON_API_KEY", "")
+LEMON_STORE_ID = os.environ.get("LEMON_STORE_ID", "")
 
 # Генерация или загрузка ключей
 SERVER_PUBLIC_KEY_HEX = ""
@@ -61,6 +63,7 @@ else:
 print(f"[✓] Public key: {SERVER_PUBLIC_KEY_HEX[:32]}...")
 print(f"[✓] Shared secret available: {bool(APP_SHARED_SECRET)}")
 print(f"[✓] Lemon webhook secret available: {bool(LEMON_WEBHOOK_SECRET)}")
+print(f"[✓] Lemon API key available: {bool(LEMON_API_KEY)}")
 
 # ─── Database ─────────────────────────────────────────────────────────────────
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
@@ -137,11 +140,43 @@ def sign_response(data: dict, ts: int) -> dict:
 
 
 def verify_webhook_signature(payload: bytes, signature: str) -> bool:
-    """Проверка подписи webhook от Lemon Squeezy"""
     if not LEMON_WEBHOOK_SECRET:
         return True
     expected = hmac.new(LEMON_WEBHOOK_SECRET.encode('utf-8'), payload, hashlib.sha256).hexdigest()
     return hmac.compare_digest(expected, signature)
+
+
+def fetch_license_key_from_lemon(order_id: int) -> str:
+    """Получает лицензионный ключ из API Lemon Squeezy по ID заказа"""
+    if not LEMON_API_KEY:
+        print(f"[!] LEMON_API_KEY not set, cannot fetch license key")
+        return None
+    
+    url = f"https://api.lemonsqueezy.com/v1/orders/{order_id}"
+    headers = {
+        "Accept": "application/vnd.api+json",
+        "Authorization": f"Bearer {LEMON_API_KEY}"
+    }
+    
+    try:
+        response = requests.get(url, headers=headers, timeout=10)
+        if response.status_code == 200:
+            data = response.json()
+            # Ищем ключ в атрибутах заказа
+            order_attrs = data.get('data', {}).get('attributes', {})
+            license_key = order_attrs.get('license_key')
+            if license_key:
+                print(f"[✓] Fetched license key from Lemon API: {license_key}")
+                return license_key
+            else:
+                print(f"[!] No license_key in order attributes")
+                return None
+        else:
+            print(f"[!] Lemon API error: {response.status_code}")
+            return None
+    except Exception as e:
+        print(f"[!] Error fetching from Lemon API: {e}")
+        return None
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -333,10 +368,10 @@ async def deactivate_license(req: DeactivateRequest):
         session.close()
 
 
-# ─── Lemon Squeezy Webhook (с подробным логированием) ────────────────────────
+# ─── Lemon Squeezy Webhook (исправлен — получаем ключ через API) ─────────────
 @app.post("/webhook/lemon")
 async def lemon_webhook(request: Request, x_signature: Optional[str] = Header(None)):
-    """Обработка webhook от Lemon Squeezy"""
+    """Обработка webhook от Lemon Squeezy — получаем ключ через API"""
     
     body = await request.body()
     
@@ -353,51 +388,27 @@ async def lemon_webhook(request: Request, x_signature: Optional[str] = Header(No
     event_name = data.get('meta', {}).get('event_name', 'unknown')
     print(f"[✓] Lemon webhook received: {event_name}")
     
-    # Выводим ВСЮ структуру для отладки (только первые 2000 символов)
-    data_str = json.dumps(data, indent=2)
-    print(f"[DEBUG] Webhook data: {data_str[:2000]}")
-    
     # Обработка события subscription_created
     if event_name == 'subscription_created':
-        # Получаем данные о подписке
         sub_data = data.get('data', {})
         sub_attrs = sub_data.get('attributes', {})
         
         customer_email = sub_attrs.get('user_email', '')
         customer_name = sub_attrs.get('user_name', '')
         variant_id = sub_attrs.get('variant_id', '')
+        order_id = sub_attrs.get('order_id')
         
-        # Пытаемся найти лицензионный ключ в разных местах
+        print(f"[✓] Order ID: {order_id}, Customer: {customer_email}")
+        
+        # Пытаемся получить лицензионный ключ через API Lemon Squeezy
         license_key = None
+        if order_id and LEMON_API_KEY:
+            license_key = fetch_license_key_from_lemon(order_id)
         
-        # Вариант 1: Прямо в атрибутах
-        if 'license_key' in sub_attrs:
-            lk = sub_attrs.get('license_key')
-            if isinstance(lk, str) and lk:
-                license_key = lk
-                print(f"[DEBUG] Found license_key in attributes (string): {license_key}")
-            elif isinstance(lk, dict) and lk.get('key'):
-                license_key = lk.get('key')
-                print(f"[DEBUG] Found license_key.key in attributes: {license_key}")
-        
-        # Вариант 2: В объекте license_key как строка
-        if not license_key:
-            lk = sub_attrs.get('license_key')
-            if lk and isinstance(lk, str):
-                license_key = lk
-                print(f"[DEBUG] Found license_key as string: {license_key}")
-        
-        # Вариант 3: В метаданных заказа
-        if not license_key:
-            relationships = sub_data.get('relationships', {})
-            order_data = relationships.get('order', {}).get('data', {})
-            if order_data:
-                print(f"[DEBUG] Order relationship found, but need to fetch")
-        
-        # Если ключ не найден — генерируем свой
+        # Если не получили — генерируем свой
         if not license_key:
             license_key = f"LS-{secrets.token_hex(8).upper()}"
-            print(f"[!] No license key from Lemon Squeezy, generated: {license_key}")
+            print(f"[!] Could not fetch license key, generated: {license_key}")
         
         expires_at = datetime.utcnow() + timedelta(days=30)
         
@@ -459,7 +470,6 @@ async def create_test_license():
 
 @app.get("/admin/licenses")
 async def list_licenses():
-    """Временный эндпоинт для просмотра всех лицензий (только для отладки)"""
     session = SessionLocal()
     try:
         licenses = session.query(License).order_by(License.created_at.desc()).limit(20).all()
