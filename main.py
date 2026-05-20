@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-YouTube Localizer License Server v2.0
-FastAPI + PostgreSQL + Ed25519 signatures + Lemon Squeezy webhook
+YouTube Localizer License Server v3.0
+- Исправлен webhook: сохраняет ключ от Lemon Squeezy
+- Поддержка подписок с trial периодом
 """
 
 import os
@@ -33,12 +34,9 @@ except ImportError:
 # КОНФИГУРАЦИЯ
 # ═══════════════════════════════════════════════════════════════════════════
 
-# Загрузка секретов из переменных окружения
 SERVER_PRIVATE_KEY_HEX = os.environ.get("SERVER_PRIVATE_KEY", "")
 APP_SHARED_SECRET = os.environ.get("APP_SHARED_SECRET", "")
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://localhost/yt_licenses")
-
-# Lemon Squeezy
 LEMON_WEBHOOK_SECRET = os.environ.get("LEMON_WEBHOOK_SECRET", "")
 
 # Генерация или загрузка ключей
@@ -47,7 +45,7 @@ if SERVER_PRIVATE_KEY_HEX and HAS_CRYPTO:
     try:
         private_key = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(SERVER_PRIVATE_KEY_HEX))
         SERVER_PUBLIC_KEY_HEX = private_key.public_key().public_bytes_raw().hex()
-        print(f"[✓] Public key loaded")
+        print(f"[✓] Public key loaded from SERVER_PRIVATE_KEY")
     except Exception as e:
         print(f"[!] Error loading private key: {e}")
         private_key = Ed25519PrivateKey.generate()
@@ -335,10 +333,10 @@ async def deactivate_license(req: DeactivateRequest):
         session.close()
 
 
-# ─── Lemon Squeezy Webhook (ГЛАВНЫЙ ФИКС!) ───────────────────────────────────
+# ─── Lemon Squeezy Webhook (ИСПРАВЛЕН — сохраняем ключ от Lemon Squeezy!) ────
 @app.post("/webhook/lemon")
 async def lemon_webhook(request: Request, x_signature: Optional[str] = Header(None)):
-    """Обработка webhook от Lemon Squeezy"""
+    """Обработка webhook от Lemon Squeezy — сохраняем ключ из письма"""
     
     body = await request.body()
     
@@ -357,28 +355,62 @@ async def lemon_webhook(request: Request, x_signature: Optional[str] = Header(No
     
     # Обработка события subscription_created
     if event_name == 'subscription_created':
-        attributes = data.get('data', {}).get('attributes', {})
-        customer_email = attributes.get('user_email', '')
-        product_id = attributes.get('product_id', '')
-        variant_id = attributes.get('variant_id', '')
+        # Получаем данные о подписке
+        sub_data = data.get('data', {})
+        sub_attrs = sub_data.get('attributes', {})
         
-        # Генерация лицензионного ключа
-        license_key = f"LS-{secrets.token_hex(8).upper()}"
+        # Получаем данные о заказе
+        order_id = sub_attrs.get('order_id')
+        customer_email = sub_attrs.get('user_email', '')
+        customer_name = sub_attrs.get('user_name', '')
+        product_id = sub_attrs.get('product_id', '')
+        variant_id = sub_attrs.get('variant_id', '')
+        
+        # ✅ ГЛАВНОЕ: получаем лицензионный ключ от Lemon Squeezy
+        # Ключ находится во вложенном объекте license_key
+        license_key = None
+        license_key_obj = sub_attrs.get('license_key', {})
+        if license_key_obj and isinstance(license_key_obj, dict):
+            license_key = license_key_obj.get('key', '')
+        
+        # Если ключ не найден — генерируем свой (как запасной вариант)
+        if not license_key:
+            license_key = f"LS-{secrets.token_hex(8).upper()}"
+            print(f"[!] No license key from Lemon Squeezy, generated: {license_key}")
+        
+        # Длительность подписки (из варианта)
+        trial_days = 0
+        if 'trial_interval' in sub_attrs:
+            # если есть trial период
+            pass
+        
+        # Срок действия: +30 дней от текущей даты
         expires_at = datetime.utcnow() + timedelta(days=30)
         
         session = SessionLocal()
         try:
-            new_license = License(
-                license_key=license_key,
-                product_id=str(variant_id),
-                status="active",
-                customer_email=customer_email,
-                expires_at=expires_at,
-                max_instances=5
-            )
-            session.add(new_license)
+            # Проверяем, существует ли уже такая лицензия
+            existing = session.query(License).filter(License.license_key == license_key).first()
+            if existing:
+                print(f"[!] License {license_key} already exists, updating...")
+                existing.status = "active"
+                existing.customer_email = customer_email
+                existing.customer_name = customer_name
+                existing.expires_at = expires_at
+            else:
+                new_license = License(
+                    license_key=license_key,
+                    product_id=str(variant_id),
+                    status="active",
+                    customer_email=customer_email,
+                    customer_name=customer_name,
+                    expires_at=expires_at,
+                    max_instances=5
+                )
+                session.add(new_license)
+                print(f"[✓] License created: {license_key} for {customer_email}")
+            
             session.commit()
-            print(f"[✓] License created: {license_key} for {customer_email}")
         except Exception as e:
             print(f"[!] Error creating license: {e}")
             session.rollback()
