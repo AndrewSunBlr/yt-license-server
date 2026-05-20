@@ -3,7 +3,7 @@
 """
 YouTube Localizer License Server v3.0
 - Исправлен webhook: сохраняет ключ от Lemon Squeezy
-- Поддержка подписок с trial периодом
+- Подробное логирование для отладки
 """
 
 import os
@@ -333,10 +333,10 @@ async def deactivate_license(req: DeactivateRequest):
         session.close()
 
 
-# ─── Lemon Squeezy Webhook (ИСПРАВЛЕН — сохраняем ключ от Lemon Squeezy!) ────
+# ─── Lemon Squeezy Webhook (с подробным логированием) ────────────────────────
 @app.post("/webhook/lemon")
 async def lemon_webhook(request: Request, x_signature: Optional[str] = Header(None)):
-    """Обработка webhook от Lemon Squeezy — сохраняем ключ из письма"""
+    """Обработка webhook от Lemon Squeezy"""
     
     body = await request.body()
     
@@ -353,43 +353,56 @@ async def lemon_webhook(request: Request, x_signature: Optional[str] = Header(No
     event_name = data.get('meta', {}).get('event_name', 'unknown')
     print(f"[✓] Lemon webhook received: {event_name}")
     
+    # Выводим ВСЮ структуру для отладки (только первые 2000 символов)
+    data_str = json.dumps(data, indent=2)
+    print(f"[DEBUG] Webhook data: {data_str[:2000]}")
+    
     # Обработка события subscription_created
     if event_name == 'subscription_created':
         # Получаем данные о подписке
         sub_data = data.get('data', {})
         sub_attrs = sub_data.get('attributes', {})
         
-        # Получаем данные о заказе
-        order_id = sub_attrs.get('order_id')
         customer_email = sub_attrs.get('user_email', '')
         customer_name = sub_attrs.get('user_name', '')
-        product_id = sub_attrs.get('product_id', '')
         variant_id = sub_attrs.get('variant_id', '')
         
-        # ✅ ГЛАВНОЕ: получаем лицензионный ключ от Lemon Squeezy
-        # Ключ находится во вложенном объекте license_key
+        # Пытаемся найти лицензионный ключ в разных местах
         license_key = None
-        license_key_obj = sub_attrs.get('license_key', {})
-        if license_key_obj and isinstance(license_key_obj, dict):
-            license_key = license_key_obj.get('key', '')
         
-        # Если ключ не найден — генерируем свой (как запасной вариант)
+        # Вариант 1: Прямо в атрибутах
+        if 'license_key' in sub_attrs:
+            lk = sub_attrs.get('license_key')
+            if isinstance(lk, str) and lk:
+                license_key = lk
+                print(f"[DEBUG] Found license_key in attributes (string): {license_key}")
+            elif isinstance(lk, dict) and lk.get('key'):
+                license_key = lk.get('key')
+                print(f"[DEBUG] Found license_key.key in attributes: {license_key}")
+        
+        # Вариант 2: В объекте license_key как строка
+        if not license_key:
+            lk = sub_attrs.get('license_key')
+            if lk and isinstance(lk, str):
+                license_key = lk
+                print(f"[DEBUG] Found license_key as string: {license_key}")
+        
+        # Вариант 3: В метаданных заказа
+        if not license_key:
+            relationships = sub_data.get('relationships', {})
+            order_data = relationships.get('order', {}).get('data', {})
+            if order_data:
+                print(f"[DEBUG] Order relationship found, but need to fetch")
+        
+        # Если ключ не найден — генерируем свой
         if not license_key:
             license_key = f"LS-{secrets.token_hex(8).upper()}"
             print(f"[!] No license key from Lemon Squeezy, generated: {license_key}")
         
-        # Длительность подписки (из варианта)
-        trial_days = 0
-        if 'trial_interval' in sub_attrs:
-            # если есть trial период
-            pass
-        
-        # Срок действия: +30 дней от текущей даты
         expires_at = datetime.utcnow() + timedelta(days=30)
         
         session = SessionLocal()
         try:
-            # Проверяем, существует ли уже такая лицензия
             existing = session.query(License).filter(License.license_key == license_key).first()
             if existing:
                 print(f"[!] License {license_key} already exists, updating...")
@@ -440,6 +453,28 @@ async def create_test_license():
         session.commit()
         
         return {"license_key": test_key, "expires_at": expires_at.isoformat()}
+    finally:
+        session.close()
+
+
+@app.get("/admin/licenses")
+async def list_licenses():
+    """Временный эндпоинт для просмотра всех лицензий (только для отладки)"""
+    session = SessionLocal()
+    try:
+        licenses = session.query(License).order_by(License.created_at.desc()).limit(20).all()
+        return {
+            "licenses": [
+                {
+                    "license_key": l.license_key,
+                    "status": l.status,
+                    "customer_email": l.customer_email,
+                    "expires_at": l.expires_at.isoformat() if l.expires_at else None,
+                    "created_at": l.created_at.isoformat()
+                }
+                for l in licenses
+            ]
+        }
     finally:
         session.close()
 
