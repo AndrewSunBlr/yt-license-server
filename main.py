@@ -1,51 +1,176 @@
-from pathlib import Path
-from dotenv import load_dotenv
-load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env")
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+YouTube Localizer License Server v3.0
+- Проверка лицензий через Lemon Squeezy API
+"""
 
 import os
+import json
 import time
 import hmac
 import hashlib
 import secrets
-import json
-import threading
-import tempfile
-from urllib.parse import urlencode
-from typing import Dict, Optional
+import requests
+from datetime import datetime, timedelta
+from typing import Optional
+from contextlib import asynccontextmanager
 
-import requests as http_requests
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Header
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from pydantic import BaseModel
+from sqlalchemy import create_engine, Column, String, Integer, DateTime, Text, Boolean
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+import uvicorn
+
+try:
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
+    HAS_CRYPTO = True
+except ImportError:
+    HAS_CRYPTO = False
 
 # ═══════════════════════════════════════════════════════════════════════════
 # КОНФИГУРАЦИЯ
 # ═══════════════════════════════════════════════════════════════════════════
-GOOGLE_CLIENT_ID     = os.getenv("GOOGLE_CLIENT_ID", "").strip()
-GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "").strip()
-GOOGLE_REDIRECT_URI  = os.getenv(
-    "GOOGLE_REDIRECT_URI",
-    "https://youtubelocalizer.com/v1/youtube/oauth-callback"
-).strip()
 
-LEMONSQUEEZY_API_KEY    = os.getenv("LEMONSQUEEZY_API_KEY", "").strip()
-LEMONSQUEEZY_STORE_URL  = os.getenv("LEMONSQUEEZY_STORE_URL", "").strip()
-LEMON_WEBHOOK_SECRET    = os.getenv("LEMON_WEBHOOK_SECRET", "").strip()
-LEMON_STORE_ID          = os.getenv("LEMON_STORE_ID", "").strip()
+SERVER_PRIVATE_KEY_HEX = os.environ.get("SERVER_PRIVATE_KEY", "")
+APP_SHARED_SECRET = os.environ.get("APP_SHARED_SECRET", "")
+DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://localhost/yt_licenses")
+LEMON_API_KEY = os.environ.get("LEMON_API_KEY", "")
 
-YT_SCOPES = " ".join([
-    "https://www.googleapis.com/auth/youtube.force-ssl",
-    "https://www.googleapis.com/auth/userinfo.email",
-    "openid",
-])
+SERVER_PUBLIC_KEY_HEX = ""
+if SERVER_PRIVATE_KEY_HEX and HAS_CRYPTO:
+    try:
+        private_key = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(SERVER_PRIVATE_KEY_HEX))
+        SERVER_PUBLIC_KEY_HEX = private_key.public_key().public_bytes_raw().hex()
+    except Exception:
+        private_key = Ed25519PrivateKey.generate()
+        SERVER_PRIVATE_KEY_HEX = private_key.private_bytes_raw().hex()
+        SERVER_PUBLIC_KEY_HEX = private_key.public_key().public_bytes_raw().hex()
+else:
+    private_key = Ed25519PrivateKey.generate()
+    SERVER_PRIVATE_KEY_HEX = private_key.private_bytes_raw().hex()
+    SERVER_PUBLIC_KEY_HEX = private_key.public_key().public_bytes_raw().hex()
 
-# Маппинг variant_id → план (заполни своими ID из LS)
-PLAN_BY_VARIANT: dict[str, str] = {
-    # "123456": "basic",
-    # "123457": "pro",
-}
+print(f"[✓] Public key: {SERVER_PUBLIC_KEY_HEX[:32]}...")
 
-app = FastAPI(title="YouTube Localizer Server", version="2.4")
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# МОДЕЛИ ДАННЫХ
+# ═══════════════════════════════════════════════════════════════════════════
+
+class License(Base):
+    __tablename__ = "licenses"
+    id = Column(Integer, primary_key=True)
+    license_key = Column(String(64), unique=True, index=True, nullable=False)
+    product_id = Column(String(32), nullable=False, default="monthly")
+    status = Column(String(16), default="active")
+    customer_email = Column(String(255))
+    customer_name = Column(String(255))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    expires_at = Column(DateTime)
+    max_instances = Column(Integer, default=1)
+    metadata_json = Column(Text, default="{}")
+
+
+class Instance(Base):
+    __tablename__ = "instances"
+    id = Column(Integer, primary_key=True)
+    license_key = Column(String(64), index=True, nullable=False)
+    instance_id = Column(String(64), unique=True, nullable=False)
+    hwid = Column(String(64), nullable=False)
+    hostname = Column(String(255))
+    first_seen = Column(DateTime, default=datetime.utcnow)
+    last_seen = Column(DateTime, default=datetime.utcnow)
+    is_active = Column(Boolean, default=True)
+
+
+class CreditBalance(Base):
+    __tablename__ = "credit_balances"
+    license_key = Column(String(64), primary_key=True)
+    balance = Column(Integer, default=0)
+    total_granted = Column(Integer, default=0)
+    total_consumed = Column(Integer, default=0)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+Base.metadata.create_all(bind=engine)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# УТИЛИТЫ
+# ═══════════════════════════════════════════════════════════════════════════
+
+def verify_signature(payload: dict, sig: str) -> bool:
+    if not APP_SHARED_SECRET:
+        return True
+    data = {k: v for k, v in payload.items() if k != 'sig'}
+    canonical = json.dumps(data, sort_keys=True, separators=(',', ':')).encode('utf-8')
+    expected = hmac.new(APP_SHARED_SECRET.encode('utf-8'), canonical, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, sig)
+
+
+def sign_response(data: dict, ts: int) -> dict:
+    response = {"data": data, "ts": ts}
+    if HAS_CRYPTO and SERVER_PRIVATE_KEY_HEX:
+        try:
+            private_key = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(SERVER_PRIVATE_KEY_HEX))
+            msg = json.dumps({"data": data, "ts": ts}, sort_keys=True, separators=(',', ':')).encode('utf-8')
+            response["sig_ed25519"] = private_key.sign(msg).hex()
+        except Exception:
+            pass
+    return response
+
+
+def verify_license_with_lemon(license_key: str) -> dict:
+    """Проверяет лицензионный ключ через API Lemon Squeezy"""
+    if not LEMON_API_KEY:
+        return {"valid": False, "reason": "no_api_key"}
+    
+    url = "https://api.lemonsqueezy.com/v1/licenses/validate"
+    headers = {
+        "Accept": "application/vnd.api+json",
+        "Authorization": f"Bearer {LEMON_API_KEY}"
+    }
+    data = {"license_key": license_key}
+    
+    try:
+        response = requests.post(url, json=data, headers=headers, timeout=10)
+        if response.status_code == 200:
+            result = response.json()
+            valid = result.get('valid', False)
+            if valid:
+                return {
+                    "valid": True,
+                    "customer_email": result.get('customer_email'),
+                    "customer_name": result.get('customer_name'),
+                    "product_name": result.get('product_name'),
+                    "expires_at": result.get('expires_at')
+                }
+            else:
+                return {"valid": False, "reason": "invalid_key"}
+        else:
+            return {"valid": False, "reason": f"api_error_{response.status_code}"}
+    except Exception as e:
+        return {"valid": False, "reason": str(e)}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# FASTAPI ПРИЛОЖЕНИЕ
+# ═══════════════════════════════════════════════════════════════════════════
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    print("🚀 License Server starting...")
+    yield
+
+
+app = FastAPI(title="YouTube Localizer License Server", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -55,510 +180,237 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ═══════════════════════════════════════════════════════════════════════════
-# ФАЙЛОВОЕ ХРАНИЛИЩЕ СЕССИЙ (атомарная запись, работает на Render)
-# ═══════════════════════════════════════════════════════════════════════════
-SESSION_FILE = Path("/tmp/yt_oauth_sessions.json")
-SESSION_TTL  = 600
-_session_lock = threading.Lock()
-
-def _read_sessions() -> dict:
-    with _session_lock:
-        try:
-            if not SESSION_FILE.exists():
-                return {}
-            raw = SESSION_FILE.read_text(encoding='utf-8')
-            if not raw.strip():
-                return {}
-            data = json.loads(raw)
-            now = time.time()
-            return {k: v for k, v in data.items()
-                    if now - v.get("created", 0) < SESSION_TTL}
-        except Exception:
-            return {}
-
-def _write_sessions(sessions: dict):
-    with _session_lock:
-        try:
-            tmp_fd, tmp_path = tempfile.mkstemp(
-                dir=SESSION_FILE.parent,
-                prefix='.tmp_sessions_', suffix='.json'
-            )
-            with os.fdopen(tmp_fd, 'w', encoding='utf-8') as f:
-                json.dump(sessions, f, ensure_ascii=False)
-            os.replace(tmp_path, SESSION_FILE)
-        except Exception as e:
-            print(f"[SESSION] Write error: {e}")
-
-def _get_session(state: str) -> Optional[dict]:
-    return _read_sessions().get(state)
-
-def _set_session(state: str, data: dict):
-    sessions = _read_sessions()
-    sessions[state] = data
-    _write_sessions(sessions)
-
-def _delete_session(state: str):
-    sessions = _read_sessions()
-    sessions.pop(state, None)
-    _write_sessions(sessions)
-
-# ═══════════════════════════════════════════════════════════════════════════
-# LEMON SQUEEZY — вспомогательные функции
-# ═══════════════════════════════════════════════════════════════════════════
-def _ls_headers() -> dict:
-    return {
-        "Accept": "application/vnd.api+json",
-        "Authorization": f"Bearer {LEMONSQUEEZY_API_KEY}",
-    }
-
-def _plan_from_variant(variant_id: str, variant_name: str = "") -> str:
-    if variant_id in PLAN_BY_VARIANT:
-        return PLAN_BY_VARIANT[variant_id]
-    name = variant_name.lower()
-    if "pro" in name:
-        return "pro"
-    if "advanced" in name or "adv" in name:
-        return "advanced"
-    return "basic"
-
-def ls_activate(license_key: str, instance_name: str) -> dict:
-    """Активация лицензии через Lemon Squeezy API"""
-    if not LEMONSQUEEZY_API_KEY:
-        return {
-            "ok": True, "plan": "basic",
-            "customer_email": "test@example.com",
-            "variant_name": "Basic", "variant_id": "",
-            "instance_id": secrets.token_hex(16), "expires_at": None,
-        }
-    try:
-        resp = http_requests.post(
-            "https://api.lemonsqueezy.com/v1/licenses/activate",
-            headers=_ls_headers(),
-            params={
-                "license_key": license_key,
-                "instance_name": instance_name or "VidLocalizer",
-            },
-            timeout=20,
-        )
-        data = resp.json()
-        if resp.status_code not in (200, 201):
-            return {"ok": False, "reason": data.get("error") or f"HTTP {resp.status_code}"}
-
-        meta          = data.get("meta", {})
-        key_info      = data.get("license_key", {})
-        instance_info = data.get("instance", {})
-        variant_id    = str(meta.get("variant_id", ""))
-        variant_name  = meta.get("variant_name", "")
-
-        return {
-            "ok": True,
-            "plan": _plan_from_variant(variant_id, variant_name),
-            "customer_email": meta.get("customer_email", ""),
-            "variant_name": variant_name,
-            "variant_id": variant_id,
-            "instance_id": str(instance_info.get("id", secrets.token_hex(16))),
-            "expires_at": key_info.get("expires_at"),
-            "activation_limit": key_info.get("activation_limit"),
-            "activation_usage": key_info.get("activation_usage"),
-        }
-    except Exception as e:
-        return {"ok": False, "reason": str(e)}
-
-def ls_validate(license_key: str, instance_id: str = "") -> dict:
-    """Валидация лицензии через Lemon Squeezy API"""
-    if not LEMONSQUEEZY_API_KEY:
-        return {"ok": True, "plan": "basic", "customer_email": "test@example.com", "expires_at": None}
-    try:
-        params = {"license_key": license_key}
-        if instance_id:
-            params["instance_id"] = instance_id
-
-        resp = http_requests.post(
-            "https://api.lemonsqueezy.com/v1/licenses/validate",
-            headers=_ls_headers(),
-            params=params,
-            timeout=20,
-        )
-        data = resp.json()
-        if resp.status_code != 200:
-            return {"ok": False, "reason": data.get("error", f"HTTP {resp.status_code}")}
-
-        meta       = data.get("meta", {})
-        key_info   = data.get("license_key", {})
-        variant_id = str(meta.get("variant_id", ""))
-        variant_name = meta.get("variant_name", "")
-
-        return {
-            "ok": data.get("valid", False),
-            "plan": _plan_from_variant(variant_id, variant_name),
-            "customer_email": meta.get("customer_email", ""),
-            "variant_name": variant_name,
-            "variant_id": variant_id,
-            "expires_at": key_info.get("expires_at"),
-            "status": key_info.get("status"),
-        }
-    except Exception as e:
-        return {"ok": False, "reason": str(e)}
-
-def _verify_webhook_signature(body: bytes, signature: str, secret: str) -> bool:
-    """
-    Проверка подписи вебхука от Lemon Squeezy.
-    LS подписывает тело запроса через HMAC-SHA256.
-    Подпись передаётся в заголовке X-Signature.
-    """
-    if not secret:
-        print("[WEBHOOK] WARNING: LEMON_WEBHOOK_SECRET not set, skipping signature check")
-        return True
-    expected = hmac.new(
-        secret.encode("utf-8"),
-        body,
-        hashlib.sha256
-    ).hexdigest()
-    return hmac.compare_digest(expected, signature)
-
-def _clean(payload: dict) -> dict:
-    return {k: v for k, v in payload.items() if k not in {"sig", "nonce", "ts"}}
-
-# ═══════════════════════════════════════════════════════════════════════════
-# БАЗОВЫЕ ENDPOINTS
-# ═══════════════════════════════════════════════════════════════════════════
-@app.get("/")
-async def root():
-    return {
-        "service": "VidLocalizer Server",
-        "version": "2.4",
-        "google_configured": bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET),
-        "ls_configured": bool(LEMONSQUEEZY_API_KEY),
-        "webhook_secret_set": bool(LEMON_WEBHOOK_SECRET),
-    }
 
 @app.get("/health")
-@app.get("/v1/health")
 async def health():
-    return {
-        "status": "healthy",
-        "version": "2.4",
-        "google_oauth_ready": bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET),
-        "ls_ready": bool(LEMONSQUEEZY_API_KEY),
-        "webhook_ready": bool(LEMON_WEBHOOK_SECRET),
-        "active_sessions": len(_read_sessions()),
-    }
+    return {"status": "ok"}
 
-# ═══════════════════════════════════════════════════════════════════════════
-# LEMON SQUEEZY WEBHOOK  ← ГЛАВНЫЙ ФИХ
-# ═══════════════════════════════════════════════════════════════════════════
-@app.post("/webhook/lemon")
-async def lemon_webhook(request: Request):
-    """
-    Принимает вебхуки от Lemon Squeezy.
-    URL в LS: https://yt-license-api-2v6d.onrender.com/webhook/lemon
-    Подписанные события: subscription_created, subscription_updated,
-                         subscription_cancelled, subscription_expired
-    """
-    body = await request.body()
 
-    # Проверяем подпись
-    signature = request.headers.get("X-Signature", "")
-    if not _verify_webhook_signature(body, signature, LEMON_WEBHOOK_SECRET):
-        print(f"[WEBHOOK] Invalid signature! sig={signature[:20]}...")
-        raise HTTPException(status_code=401, detail="Invalid webhook signature")
+@app.get("/pubkey")
+async def pubkey():
+    return {"public_key": SERVER_PUBLIC_KEY_HEX if SERVER_PUBLIC_KEY_HEX else "not_available"}
 
+
+class ActivateRequest(BaseModel):
+    license_key: str
+    hwid: str
+    instance: str
+    nonce: str
+    ts: int
+    sig: str
+
+
+class ValidateRequest(BaseModel):
+    license_key: str
+    instance_id: str
+    hwid: str
+    nonce: str
+    ts: int
+    sig: str
+
+
+class DeactivateRequest(BaseModel):
+    license_key: str
+    instance_id: str
+    hwid: str
+    nonce: str
+    ts: int
+    sig: str
+
+
+@app.post("/license/activate")
+async def activate_license(req: ActivateRequest):
+    payload = req.model_dump()
+    sig = payload.pop("sig", "")
+    
+    if not verify_signature(payload, sig):
+        raise HTTPException(status_code=401, detail="invalid_signature")
+    
+    now = int(time.time())
+    if abs(now - req.ts) > 300:
+        raise HTTPException(status_code=400, detail="timestamp_out_of_window")
+    
+    # Сначала проверяем в локальной БД
+    session = SessionLocal()
     try:
-        payload = json.loads(body)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON body")
-
-    event_name = payload.get("meta", {}).get("event_name", "unknown")
-    print(f"[WEBHOOK] Received event: {event_name}")
-
-    # ── subscription_created ──────────────────────────────────────────────
-    if event_name == "subscription_created":
-        sub = payload.get("data", {}).get("attributes", {})
-        customer_email = sub.get("user_email", "")
-        status         = sub.get("status", "")
-        variant_name   = sub.get("variant_name", "")
-        variant_id     = str(payload.get("data", {}).get("relationships", {})
-                             .get("variant", {}).get("data", {}).get("id", ""))
-        plan = _plan_from_variant(variant_id, variant_name)
-
-        print(f"[WEBHOOK] subscription_created: email={customer_email} plan={plan} status={status}")
-        # Здесь можно сохранить в БД: активировать подписку для email
-        return {"received": True, "event": event_name, "plan": plan, "email": customer_email}
-
-    # ── subscription_updated ──────────────────────────────────────────────
-    elif event_name == "subscription_updated":
-        sub    = payload.get("data", {}).get("attributes", {})
-        status = sub.get("status", "")
-        email  = sub.get("user_email", "")
-        print(f"[WEBHOOK] subscription_updated: email={email} status={status}")
-        # active | past_due | paused | cancelled | expired
-        return {"received": True, "event": event_name, "status": status, "email": email}
-
-    # ── subscription_cancelled ────────────────────────────────────────────
-    elif event_name == "subscription_cancelled":
-        sub   = payload.get("data", {}).get("attributes", {})
-        email = sub.get("user_email", "")
-        ends_at = sub.get("ends_at", "")
-        print(f"[WEBHOOK] subscription_cancelled: email={email} ends_at={ends_at}")
-        # Подписка ещё действует до ends_at, после — истекает
-        return {"received": True, "event": event_name, "email": email, "ends_at": ends_at}
-
-    # ── subscription_expired ──────────────────────────────────────────────
-    elif event_name == "subscription_expired":
-        sub   = payload.get("data", {}).get("attributes", {})
-        email = sub.get("user_email", "")
-        print(f"[WEBHOOK] subscription_expired: email={email}")
-        return {"received": True, "event": event_name, "email": email}
-
-    # ── Все остальные события ─────────────────────────────────────────────
-    else:
-        print(f"[WEBHOOK] Unhandled event: {event_name}")
-        return {"received": True, "event": event_name}
-
-# ═══════════════════════════════════════════════════════════════════════════
-# LICENSE ENDPOINTS
-# ═══════════════════════════════════════════════════════════════════════════
-@app.get("/v1/license/store-url")
-async def get_store_url():
-    if not LEMONSQUEEZY_STORE_URL:
-        raise HTTPException(500, "Store URL not configured")
-    return {"store_url": LEMONSQUEEZY_STORE_URL}
-
-@app.post("/v1/license/activate")
-async def activate_license(payload: dict):
-    fields      = _clean(payload)
-    license_key = fields.get("license_key", "").strip()
-    hwid        = fields.get("hwid", "").strip()
-    instance    = fields.get("instance", "") or hwid or "VidLocalizer"
-
-    if not license_key:
-        raise HTTPException(400, "Missing license_key")
-    if not hwid:
-        raise HTTPException(400, "Missing hwid")
-
-    result = ls_activate(license_key, instance_name=instance)
-    if not result.get("ok"):
-        return {"activated": False, "reason": result.get("reason", "License activation failed")}
-
-    return {
-        "activated": True,
-        "status": "active",
-        "instance_id": result.get("instance_id"),
-        "expires_at": result.get("expires_at"),
-        "meta": {
-            "plan": result["plan"],
-            "customer_email": result["customer_email"],
-            "product_name": "VidLocalizer",
-            "variant_name": result.get("variant_name", ""),
-            "variant_id": result.get("variant_id", ""),
-        },
-    }
-
-@app.post("/v1/license/validate")
-async def validate_license(payload: dict):
-    fields      = _clean(payload)
-    license_key = fields.get("license_key", "").strip()
-    # Принимаем и instance_id и hwid для обратной совместимости
-    instance_id = fields.get("instance_id", "").strip() or fields.get("hwid", "").strip()
-
-    if not license_key:
-        return {"valid": False, "reason": "no_key"}
-
-    result = ls_validate(license_key, instance_id=instance_id)
-    return {
-        "valid": result.get("ok", False),
-        "status": result.get("status", "unknown"),
-        "expires_at": result.get("expires_at"),
-        "reason": result.get("reason"),
-        "meta": {
-            "plan": result.get("plan", "basic"),
-            "customer_email": result.get("customer_email", ""),
-            "variant_name": result.get("variant_name", ""),
-        },
-    }
-
-@app.get("/v1/license/check")
-async def check_license_get(license_key: str = ""):
-    if not license_key:
-        return {"active": False, "reason": "no_key"}
-    result = ls_validate(license_key)
-    return {"active": result.get("ok", False), "data": result}
-
-@app.post("/v1/license/transfer")
-async def transfer_license(payload: dict):
-    fields      = _clean(payload)
-    license_key = fields.get("license_key", "").strip()
-    if not license_key:
-        raise HTTPException(400, "Missing license_key")
-    result = ls_validate(license_key)
-    return {"transferred": result.get("ok", False), "data": result}
-
-# ═══════════════════════════════════════════════════════════════════════════
-# YOUTUBE OAUTH
-# ═══════════════════════════════════════════════════════════════════════════
-@app.get("/v1/youtube/auth-url")
-async def get_youtube_auth_url():
-    if not GOOGLE_CLIENT_ID:
-        raise HTTPException(500, "GOOGLE_CLIENT_ID not configured")
-    state = secrets.token_urlsafe(32)
-    _set_session(state, {"created": time.time(), "tokens": None, "user_info": None, "error": None})
-    params = {
-        "client_id": GOOGLE_CLIENT_ID,
-        "redirect_uri": GOOGLE_REDIRECT_URI,
-        "response_type": "code",
-        "scope": YT_SCOPES,
-        "access_type": "offline",
-        "include_granted_scopes": "true",
-        "prompt": "consent",
-        "state": state,
-    }
-    auth_url = "https://accounts.google.com/o/oauth2/v2/auth?" + urlencode(params)
-    return {"auth_url": auth_url, "state": state}
-
-@app.get("/v1/youtube/oauth-callback")
-async def oauth_callback(code: str = "", state: str = "", error: str = ""):
-    session = _get_session(state)
-    if not session:
-        return HTMLResponse("<h2 style='color:red;font-family:sans-serif;text-align:center;padding:60px'>❌ Invalid or expired session</h2>", status_code=400)
-
-    if error:
-        session["error"] = error
-        _set_session(state, session)
-        return HTMLResponse(f"<h2 style='color:red;font-family:sans-serif;text-align:center;padding:60px'>❌ Google error: {error}</h2>")
-
-    if not code:
-        session["error"] = "no_code"
-        _set_session(state, session)
-        return HTMLResponse("<h2>❌ No authorization code</h2>", status_code=400)
-
-    try:
-        token_resp = http_requests.post(
-            "https://oauth2.googleapis.com/token",
-            data={
-                "code": code,
-                "client_id": GOOGLE_CLIENT_ID,
-                "client_secret": GOOGLE_CLIENT_SECRET,
-                "redirect_uri": GOOGLE_REDIRECT_URI,
-                "grant_type": "authorization_code",
-            },
-            timeout=20,
+        lic = session.query(License).filter(License.license_key == req.license_key).first()
+        
+        # Если нет в БД — проверяем через Lemon API
+        if not lic and LEMON_API_KEY:
+            lemon_result = verify_license_with_lemon(req.license_key)
+            if lemon_result.get("valid"):
+                # Сохраняем валидную лицензию из Lemon в БД
+                lic = License(
+                    license_key=req.license_key,
+                    product_id="lemon_monthly",
+                    status="active",
+                    customer_email=lemon_result.get("customer_email", ""),
+                    customer_name=lemon_result.get("customer_name", ""),
+                    expires_at=datetime.utcnow() + timedelta(days=30),
+                    max_instances=5
+                )
+                session.add(lic)
+                session.commit()
+                print(f"[✓] License from Lemon saved: {req.license_key}")
+            else:
+                return sign_response({"activated": False, "reason": "invalid_license"}, now)
+        
+        if not lic:
+            return sign_response({"activated": False, "reason": "invalid_license"}, now)
+        
+        if lic.status != "active":
+            return sign_response({"activated": False, "reason": f"license_{lic.status}"}, now)
+        
+        if lic.expires_at and lic.expires_at < datetime.utcnow():
+            return sign_response({"activated": False, "reason": "expired"}, now)
+        
+        active_instances = session.query(Instance).filter(
+            Instance.license_key == req.license_key,
+            Instance.is_active == True
+        ).count()
+        
+        if active_instances >= lic.max_instances:
+            return sign_response({"activated": False, "reason": "max_instances_reached"}, now)
+        
+        instance_id = secrets.token_hex(16)
+        new_instance = Instance(
+            license_key=req.license_key,
+            instance_id=instance_id,
+            hwid=req.hwid,
+            hostname=req.instance,
+            is_active=True
         )
-        tokens = token_resp.json()
-
-        if "error" in tokens or "access_token" not in tokens:
-            err = tokens.get("error_description") or tokens.get("error") or "unknown"
-            session["error"] = err
-            _set_session(state, session)
-            return HTMLResponse(f"<h2 style='color:red;font-family:sans-serif;text-align:center;padding:60px'>❌ Token error: {err}</h2>", status_code=400)
-
-        user_info = {}
-        try:
-            ui = http_requests.get(
-                "https://www.googleapis.com/oauth2/v2/userinfo",
-                headers={"Authorization": f"Bearer {tokens['access_token']}"},
-                timeout=10,
-            )
-            if ui.ok:
-                user_info = ui.json()
-        except Exception:
-            pass
-
-        session["tokens"]    = tokens
-        session["user_info"] = user_info
-        _set_session(state, session)
-        email = user_info.get("email", "—")
-
-        return HTMLResponse(f"""
-        <html><head><title>Authorized</title></head>
-        <body style="font-family:sans-serif;background:#0b0d14;color:#eef0fa;text-align:center;padding:80px">
-          <div style="display:inline-block;background:#1f2333;padding:40px 60px;border-radius:12px;border:1px solid #3ddc84">
-            <h1 style="color:#3ddc84;margin:0 0 16px">✅ Authorization Successful</h1>
-            <p style="font-size:18px">Signed in as <b style="color:#fff">{email}</b></p>
-            <p style="color:#8088a8;margin-top:20px">You may close this window and return to the application.</p>
-          </div>
-          <script>setTimeout(function(){{try{{window.close();}}catch(e){{}}}}}, 2500);</script>
-        </body></html>
-        """)
+        session.add(new_instance)
+        session.commit()
+        
+        balance = session.query(CreditBalance).filter(CreditBalance.license_key == req.license_key).first()
+        if not balance:
+            balance = CreditBalance(license_key=req.license_key, balance=10, total_granted=10)
+            session.add(balance)
+            session.commit()
+        
+        return sign_response({
+            "activated": True,
+            "instance_id": instance_id,
+            "status": "active",
+            "expires_at": lic.expires_at.isoformat() if lic.expires_at else None,
+            "meta": {"product_name": "YouTube Localizer", "customer_email": lic.customer_email, "plan": lic.product_id}
+        }, now)
+        
     except Exception as e:
-        session["error"] = str(e)
-        _set_session(state, session)
-        return HTMLResponse(f"<h2>❌ Server error: {e}</h2>", status_code=500)
+        session.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        session.close()
 
-@app.get("/v1/youtube/check-auth")
-async def check_auth(state: str):
-    session = _get_session(state)
-    if not session:
-        return {"status": "expired"}
-    if session.get("error"):
-        err = session["error"]
-        _delete_session(state)
-        return {"status": "error", "error": err}
-    if session.get("tokens"):
-        result = {"status": "success", "tokens": session["tokens"], "user_info": session["user_info"] or {}}
-        _delete_session(state)
-        return result
-    return {"status": "pending"}
 
-@app.post("/v1/youtube/refresh-token")
-async def refresh_token(payload: dict):
-    rt = payload.get("refresh_token", "").strip()
-    if not rt:
-        raise HTTPException(400, "Missing refresh_token")
+@app.post("/license/validate")
+async def validate_license(req: ValidateRequest):
+    payload = req.model_dump()
+    sig = payload.pop("sig", "")
+    
+    if not verify_signature(payload, sig):
+        raise HTTPException(status_code=401, detail="invalid_signature")
+    
+    now = int(time.time())
+    if abs(now - req.ts) > 300:
+        raise HTTPException(status_code=400, detail="timestamp_out_of_window")
+    
+    session = SessionLocal()
     try:
-        r = http_requests.post(
-            "https://oauth2.googleapis.com/token",
-            data={
-                "client_id": GOOGLE_CLIENT_ID,
-                "client_secret": GOOGLE_CLIENT_SECRET,
-                "refresh_token": rt,
-                "grant_type": "refresh_token",
-            },
-            timeout=15,
+        lic = session.query(License).filter(License.license_key == req.license_key).first()
+        if not lic:
+            return sign_response({"valid": False, "reason": "invalid_license"}, now)
+        
+        if lic.status != "active":
+            return sign_response({"valid": False, "reason": f"license_{lic.status}"}, now)
+        
+        if lic.expires_at and lic.expires_at < datetime.utcnow():
+            return sign_response({"valid": False, "reason": "expired"}, now)
+        
+        inst = session.query(Instance).filter(
+            Instance.license_key == req.license_key,
+            Instance.instance_id == req.instance_id
+        ).first()
+        
+        if not inst:
+            return sign_response({"valid": False, "reason": "instance_not_found"}, now)
+        
+        if inst.hwid != req.hwid:
+            return sign_response({"valid": False, "reason": "hwid_mismatch"}, now)
+        
+        inst.last_seen = datetime.utcnow()
+        session.commit()
+        
+        return sign_response({"valid": True, "status": lic.status, "expires_at": lic.expires_at.isoformat() if lic.expires_at else None}, now)
+        
+    finally:
+        session.close()
+
+
+@app.post("/license/deactivate")
+async def deactivate_license(req: DeactivateRequest):
+    payload = req.model_dump()
+    sig = payload.pop("sig", "")
+    
+    if not verify_signature(payload, sig):
+        raise HTTPException(status_code=401, detail="invalid_signature")
+    
+    session = SessionLocal()
+    try:
+        inst = session.query(Instance).filter(Instance.instance_id == req.instance_id).first()
+        if inst:
+            inst.is_active = False
+            session.commit()
+        return sign_response({"deactivated": True}, int(time.time()))
+    finally:
+        session.close()
+
+
+@app.post("/admin/create_test_license")
+async def create_test_license():
+    session = SessionLocal()
+    try:
+        test_key = "TEST-" + secrets.token_hex(8).upper()
+        expires_at = datetime.utcnow() + timedelta(days=30)
+        
+        license = License(
+            license_key=test_key,
+            product_id="test_monthly",
+            status="active",
+            customer_email="test@example.com",
+            expires_at=expires_at,
+            max_instances=5
         )
-        data = r.json()
-        if "error" in data:
-            raise HTTPException(401, data.get("error_description", data["error"]))
-        return data
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(502, str(e))
+        session.add(license)
+        session.commit()
+        
+        return {"license_key": test_key, "expires_at": expires_at.isoformat()}
+    finally:
+        session.close()
 
-@app.post("/v1/youtube/revoke")
-async def revoke_token(payload: dict):
-    token = payload.get("refresh_token") or payload.get("access_token") or ""
-    if not token:
-        raise HTTPException(400, "Missing token")
+
+@app.get("/admin/licenses")
+async def list_licenses():
+    session = SessionLocal()
     try:
-        http_requests.post("https://oauth2.googleapis.com/revoke", params={"token": token}, timeout=10)
-        return {"revoked": True}
-    except Exception as e:
-        return {"revoked": False, "error": str(e)}
+        licenses = session.query(License).order_by(License.created_at.desc()).limit(20).all()
+        return {
+            "licenses": [
+                {
+                    "license_key": l.license_key,
+                    "status": l.status,
+                    "customer_email": l.customer_email,
+                    "expires_at": l.expires_at.isoformat() if l.expires_at else None,
+                    "created_at": l.created_at.isoformat()
+                }
+                for l in licenses
+            ]
+        }
+    finally:
+        session.close()
 
-# ═══════════════════════════════════════════════════════════════════════════
-# TRANSLATION
-# ═══════════════════════════════════════════════════════════════════════════
-@app.post("/v1/translate")
-async def translate(payload: dict):
-    text   = payload.get("text", "")
-    source = payload.get("source_lang", "auto")
-    target = payload.get("target_lang", "en")
-    try:
-        from deep_translator import GoogleTranslator
-        translated = GoogleTranslator(source=source, target=target).translate(text)
-        return {"translated_text": translated or text, "target_lang": target}
-    except Exception as e:
-        return {"translated_text": text, "error": str(e)}
-
-@app.post("/v1/usage/check")
-async def usage_check(payload: dict):
-    return {"allowed": True, "remaining": 999}
-
-@app.post("/v1/usage/increment")
-async def usage_increment(payload: dict):
-    return {"ok": True}
 
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
